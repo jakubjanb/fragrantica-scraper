@@ -1,1 +1,15 @@
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs and caches
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# IDEs and OS files
+.idea/
+.DS_Store
