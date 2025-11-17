@@ -1,4 +1,4 @@
-Fragrantica Perfume Scraper
+git remote -vFragrantica Perfume Scraper
 
 A command‑line scraper that crawls perfume pages on Fragrantica and saves: brand, perfume name, rating, votes, URL, and crawl timestamp into a CSV file.
 

@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Fragrance Srapper.iml" filepath="$PROJECT_DIR$/.idea/Fragrance Srapper.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/fragrantica-scraper.iml" filepath="$PROJECT_DIR$/.idea/fragrantica-scraper.iml" />
     </modules>
   </component>
 </project>
