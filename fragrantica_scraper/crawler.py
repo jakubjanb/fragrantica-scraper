@@ -1,301 +1,43 @@
 #!/usr/bin/env python3
 """
-Fragrantica perfume scraper
+Fragrantica scraper crawler orchestration.
 
-Crawls perfume pages on https://www.fragrantica.com and stores
-brand, perfume name, rating and votes into a CSV file.
-
-Usage examples:
-    python -m fragrantica_scraper.crawler \
-        --start-url https://www.fragrantica.com/perfume/EIGHT-BOB/EIGHT-BOB-16295.html \
-        --max-pages 25 --out-csv perfumes.csv
-
-Note: Respect robots.txt and the website's terms of service. This tool is for
-personal/educational purposes only.
+Holds the core crawling loop, while parsing, networking, storage, and
+configuration are delegated to dedicated modules to improve maintainability.
 """
-import argparse
+from __future__ import annotations
+
 import collections
-import csv
 import datetime as dt
 import os
 import random
 import re
 import sys
-import time
-from typing import Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from typing import Optional
+from argparse import Namespace
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 import urllib.robotparser as robotparser
 
-DOMAIN = "www.fragrantica.com"
-PERFUME_URL_RE = re.compile(
-    r"^https?://(?:www\.)?fragrantica\.com/perfume/[^/]+/[^/]+-\d+\.html$",
-    re.IGNORECASE,
+from .config import (
+    DOMAIN,
+    PERFUME_URL_RE,
+    DEFAULT_UAS,
+    DEFAULT_ACCEPT_LANGS,
 )
-# Path-only matcher for tighter link filtering
-PERFUME_PATH_RE = re.compile(r"^/perfume/[^/]+/[^/]+-\d+\.html$", re.IGNORECASE)
-AVOID_PREFIXES = (
-    "/board/", "/designers/", "/search/", "/news/", "/articles/", "/perfumery/",
+from .network import (
+    build_session,
+    can_fetch,
+    normalize_url,
+    extract_links,
+    polite_sleep,
+    session_sleep,
+    backoff_sleep,
 )
-RATING_VOTES_RE = re.compile(
-    r"Perfume\s+rating\s+([0-9]+(?:\.[0-9]+)?)\s+out\s+of\s+5\s+with\s+([\d,]+)\s+votes",
-    re.IGNORECASE,
-)
-DESIGNER_LABEL_RE = re.compile(r"^\s*Designer\s*", re.IGNORECASE)
-
-# ------------------------------------------------------------
-# CSV helpers
-# ------------------------------------------------------------
-CSV_FIELDS = ["brand", "name", "rating", "votes", "url", "last_crawled"]
-
-def ensure_csv_with_header(path: str):
-    # Create parent directory and the file with header if it doesn't exist
-    parent = os.path.dirname(path)
-    if parent and not os.path.isdir(parent):
-        try:
-            os.makedirs(parent, exist_ok=True)
-        except Exception:
-            pass
-    if not os.path.exists(path):
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            writer.writeheader()
-
-
-def load_existing_urls(path: str):
-    urls = set()
-    if not os.path.exists(path):
-        return urls
-    try:
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                url = (row.get("url") or "").strip()
-                if url:
-                    urls.add(url)
-    except Exception:
-        # If CSV is malformed, ignore for now (we'll append valid rows)
-        pass
-    return urls
-
-
-def append_row(path: str, row: dict):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writerow(row)
-
-# ------------------------------------------------------------
-# Parsing helpers
-# ------------------------------------------------------------
-def clean_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip()
-
-def parse_brand_from_page(soup: BeautifulSoup) -> Optional[str]:
-    # Look for "Designer <Brand>"
-    for node in soup.find_all(text=DESIGNER_LABEL_RE):
-        # Often "Designer EIGHT & BOB"
-        try:
-            # Sometimes the brand is in the next sibling or parent context
-            sibling_text = node.parent.get_text(" ", strip=True)
-            m = re.search(r"Designer\s+(.*)", sibling_text, re.IGNORECASE)
-            if m:
-                return clean_space(m.group(1))
-        except Exception:
-            pass
-    # Try a meta tag fallback
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        # Often "EIGHT & BOB EIGHT & BOB for men"
-        txt = og_title["content"]
-        # Brand is usually the first token(s) before the fragrance name; this is fuzzy.
-        # We'll return None here and let URL fallback handle it.
-    return None
-
-def parse_name_from_page(soup: BeautifulSoup) -> Optional[str]:
-    # Try the H1 first
-    h1 = soup.find(["h1", "h2"])
-    if h1:
-        txt = clean_space(h1.get_text(" ", strip=True))
-        # Commonly ends with "for men/women/unisex" — strip that if present
-        txt = re.sub(r"\s+for\s+(men|women|unisex)\s*$", "", txt, flags=re.IGNORECASE)
-        # Remove duplicated brand prefix if present — we keep it as fragrance name anyway
-        return txt if txt else None
-
-    # Try og:title
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        txt = clean_space(og_title["content"])
-        txt = re.sub(r"\s+for\s+(men|women|unisex)\s*$", "", txt, flags=re.IGNORECASE)
-        return txt if txt else None
-
-    return None
-
-def parse_rating_votes_from_text(text: str) -> Tuple[Optional[float], Optional[int]]:
-    m = RATING_VOTES_RE.search(text)
-    if not m:
-        return None, None
-    rating = float(m.group(1))
-    votes = int(m.group(2).replace(",", ""))
-    return rating, votes
-
-def parse_brand_name_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
-    # /perfume/<brand>/<name>-<id>.html
-    try:
-        path = urlparse(url).path
-        parts = [p for p in path.split("/") if p]
-        if len(parts) >= 3 and parts[0].lower() == "perfume":
-            brand = parts[1]
-            name_and_id = parts[2]
-            # remove the -<id>.html suffix
-            name = re.sub(r"-\d+\.html$", "", name_and_id, flags=re.IGNORECASE)
-            # de-slug
-            brand = clean_space(brand.replace("-", " ").replace("%26", "&").replace("%20", " "))
-            name = clean_space(name.replace("-", " ").replace("%26", "&").replace("%20", " "))
-            return brand, name
-    except Exception:
-        pass
-    return None, None
-
-# ------------------------------------------------------------
-# Crawl + fetch
-# ------------------------------------------------------------
-DEFAULT_UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-]
-DEFAULT_ACCEPT_LANGS = [
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.9",
-    "en-US;q=0.8,en;q=0.7",
-]
-
-def build_session(user_agent: str, timeout: float, proxy: Optional[str] = None, accept_language: Optional[str] = None):
-    # If the placeholder UA is used, pick a realistic one for the session
-    if user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)":
-        user_agent = random.choice(DEFAULT_UAS)
-    if not accept_language:
-        accept_language = random.choice(DEFAULT_ACCEPT_LANGS)
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": user_agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": accept_language,
-        "Connection": "keep-alive",
-    })
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
-    s.timeout = timeout
-    return s
-
-def can_fetch(rp: robotparser.RobotFileParser, ua: str, url: str) -> bool:
-    try:
-        return rp.can_fetch(ua, url)
-    except Exception:
-        return False
-
-def normalize_url(url: str) -> Optional[str]:
-    try:
-        u = urlparse(url)
-        if not u.scheme:
-            return None
-        if u.netloc.lower().startswith("fragrantica.com"):
-            # force www
-            u = u._replace(netloc=DOMAIN)
-        # Remove fragments
-        u = u._replace(fragment="")
-        return urlunparse(u)
-    except Exception:
-        return None
-
-def extract_links(base_url: str, soup: BeautifulSoup):
-    links = set()
-    for a in soup.find_all("a", href=True):
-        full = urljoin(base_url, a["href"])  # absolute
-        full = normalize_url(full)
-        if not full:
-            continue
-        u = urlparse(full)
-        if u.netloc != DOMAIN:
-            continue
-        path = u.path or "/"
-        # Allow only perfume detail pages; skip sensitive/rate-limited sections
-        if not PERFUME_PATH_RE.match(path):
-            if any(path.startswith(p) for p in AVOID_PREFIXES):
-                continue
-            # Skip non-perfume paths altogether
-            continue
-        # Exclude obvious non-HTML assets
-        if any(full.lower().endswith(ext) for ext in (".jpg", ".png", ".gif", ".svg", ".css", ".js", ".json", ".xml")):
-            continue
-        links.add(full)
-    return links
-
-def polite_sleep(delay_min: float, delay_max: float):
-    time.sleep(random.uniform(delay_min, delay_max))
-
-
-def session_sleep(total_seconds: float, jitter_ratio: float = 0.1):
-    """Take a longer break between scraping sessions.
-
-    Args:
-        total_seconds: Target seconds to sleep.
-        jitter_ratio: Adds +/- jitter_ratio fraction to avoid exact patterns.
-    """
-    if total_seconds <= 0:
-        return
-    jitter = total_seconds * jitter_ratio
-    time.sleep(random.uniform(max(0.0, total_seconds - jitter), total_seconds + jitter))
-
-
-def backoff_sleep(resp, base_delay: float, attempt: int):
-    """Honor Retry-After and apply exponential backoff with jitter."""
-    retry_after = None
-    if resp is not None:
-        try:
-            retry_after = resp.headers.get("Retry-After")
-        except Exception:
-            retry_after = None
-    if retry_after:
-        try:
-            seconds = float(retry_after)
-            time.sleep(max(seconds, base_delay))
-            return
-        except Exception:
-            # If not numeric, fall through to exponential backoff
-            pass
-    sleep_min = base_delay * (2 ** (attempt - 1))
-    sleep_max = sleep_min + 1.5
-    polite_sleep(sleep_min, sleep_max)
-
-# ------------------------------------------------------------
-# Main scrape logic
-# ------------------------------------------------------------
-def scrape_perfume_page(url: str, soup: BeautifulSoup):
-    page_text = soup.get_text(" ", strip=True)
-    rating, votes = parse_rating_votes_from_text(page_text)
-
-    brand = parse_brand_from_page(soup)
-    name = parse_name_from_page(soup)
-
-    # Fallbacks from URL when needed
-    u_brand, u_name = parse_brand_name_from_url(url)
-    if brand is None:
-        brand = u_brand
-    if name is None:
-        name = u_name
-
-    # Final cleanup
-    brand = clean_space(brand or "")
-    name = clean_space(name or "")
-
-    return {
-        "brand": brand or None,
-        "name": name or None,
-        "rating": rating,
-        "votes": votes,
-    }
+from .parsing import parse_brand_name_from_url, scrape_perfume_page
+from .storage import ensure_csv_with_header, load_existing_urls, append_row
 
 def _normalize_brand_compare(s: Optional[str]) -> Optional[str]:
     if s is None:
@@ -319,7 +61,7 @@ def _brand_to_perfume_slug(brand: str) -> str:
     return "-".join(words)
 
 
-def crawl(args):
+def crawl(args: Namespace) -> None:
     # Determine brand (company) if provided
     brand_input = (args.brand or "").strip()
     if not brand_input and sys.stdin and sys.stdin.isatty():
@@ -583,68 +325,4 @@ def crawl(args):
     print(f"\nDone. Pages processed (perfume pages saved/attempted): {pages_processed}")
     print(f"CSV path: {out_csv}")
 
-# ------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Crawl Fragrantica perfume pages and store rating/votes in a CSV file."
-    )
-    parser.add_argument(
-        "--start-url",
-        action="append",
-        required=False,
-        help=(
-            "Seed URL (can be specified multiple times). If omitted and --brand is provided, the scraper "
-            "will start from the brand's designers page. Example seed: "
-            "https://www.fragrantica.com/perfume/EIGHT-BOB/EIGHT-BOB-16295.html"
-        ),
-    )
-    parser.add_argument(
-        "--brand",
-        help=(
-            "Company/brand name to scrape (interactive prompt will ask if not provided). Only fragrances "
-            "from this brand will be saved, and the output CSV will default to <brand>.csv."
-        ),
-    )
-    parser.add_argument("--out-csv", default="perfumes.csv", help="Path to output CSV file.")
-    parser.add_argument("--max-pages", type=int, default=100, help="Max perfume pages to save. Use 0 or a negative number for no limit.")
-    parser.add_argument("--delay-seconds", type=float, default=5.0, help="Base politeness delay between requests.")
-    parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds.")
-    parser.add_argument(
-        "--user-agent",
-        default="Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)",
-        help="User-Agent string used for requests.",
-    )
-    parser.add_argument(
-        "--session-size",
-        type=int,
-        default=30,
-        help="Number of perfume pages to save before taking a longer cooldown break.",
-    )
-    parser.add_argument(
-        "--session-break-seconds",
-        type=float,
-        default=900,
-        help="Cooldown duration (in seconds) after each session. Default 900s (15 minutes).",
-    )
-    parser.add_argument(
-        "--proxy",
-        help="Proxy URL to use for requests (e.g., http://user:pass@host:port or socks5://user:pass@host:port).",
-    )
-    parser.add_argument(
-        "--proxies-file",
-        help="Path to a file with one proxy per line. Lines starting with # are ignored.",
-    )
-    parser.add_argument(
-        "--rotate-every",
-        type=int,
-        default=0,
-        help="Rotate proxy/User-Agent/Accept-Language after N processed perfume pages (0 disables).",
-    )
-    args = parser.parse_args()
-    crawl(args)
-
-if __name__ == "__main__":
-    main()
+__all__ = ["crawl"]

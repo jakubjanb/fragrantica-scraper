@@ -1,0 +1,110 @@
+"""HTML parsing and regex-based extraction utilities.
+
+Contains functions that operate on BeautifulSoup documents or text to parse
+brands, names, ratings, and derive data from URLs.
+"""
+from __future__ import annotations
+
+import re
+from typing import Optional, Tuple, Dict
+
+from bs4 import BeautifulSoup
+
+from .config import DESIGNER_LABEL_RE, RATING_VOTES_RE
+
+
+def clean_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def parse_brand_from_page(soup: BeautifulSoup) -> Optional[str]:
+    # Look for "Designer <Brand>"
+    for node in soup.find_all(text=DESIGNER_LABEL_RE):
+        try:
+            sibling_text = node.parent.get_text(" ", strip=True)
+            m = re.search(r"Designer\s+(.*)", sibling_text, re.IGNORECASE)
+            if m:
+                return clean_space(m.group(1))
+        except Exception:
+            pass
+    # Try a meta tag fallback
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        # Often contains brand + name, but it's fuzzy. Return None to rely on URL fallback.
+        _ = og_title["content"]
+    return None
+
+
+def parse_name_from_page(soup: BeautifulSoup) -> Optional[str]:
+    # Try the H1/H2
+    h1 = soup.find(["h1", "h2"])
+    if h1:
+        txt = clean_space(h1.get_text(" ", strip=True))
+        txt = re.sub(r"\s+for\s+(men|women|unisex)\s*$", "", txt, flags=re.IGNORECASE)
+        return txt if txt else None
+
+    # Try og:title
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content"):
+        txt = clean_space(og_title["content"])
+        txt = re.sub(r"\s+for\s+(men|women|unisex)\s*$", "", txt, flags=re.IGNORECASE)
+        return txt if txt else None
+
+    return None
+
+
+def parse_rating_votes_from_text(text: str) -> Tuple[Optional[float], Optional[int]]:
+    m = RATING_VOTES_RE.search(text)
+    if not m:
+        return None, None
+    rating = float(m.group(1))
+    votes = int(m.group(2).replace(",", ""))
+    return rating, votes
+
+
+def parse_brand_name_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    # /perfume/<brand>/<name>-<id>.html
+    try:
+        from urllib.parse import urlparse
+
+        path = urlparse(url).path
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 3 and parts[0].lower() == "perfume":
+            brand = parts[1]
+            name_and_id = parts[2]
+            # remove the -<id>.html suffix
+            name = re.sub(r"-\d+\.html$", "", name_and_id, flags=re.IGNORECASE)
+            # de-slug
+            brand = clean_space(brand.replace("-", " ").replace("%26", "&").replace("%20", " "))
+            name = clean_space(name.replace("-", " ").replace("%26", "&").replace("%20", " "))
+            return brand, name
+    except Exception:
+        pass
+    return None, None
+
+
+def scrape_perfume_page(url: str, soup: BeautifulSoup) -> Dict[str, object]:
+    """Extract brand, name, rating, votes from a fragrance detail page."""
+    page_text = soup.get_text(" ", strip=True)
+    rating, votes = parse_rating_votes_from_text(page_text)
+
+    brand = parse_brand_from_page(soup)
+    name = parse_name_from_page(soup)
+
+    # Fallbacks from URL when needed
+    u_brand, u_name = parse_brand_name_from_url(url)
+    if brand is None:
+        brand = u_brand
+    if name is None:
+        name = u_name
+
+    # Final cleanup
+    brand = clean_space(brand or "")
+    name = clean_space(name or "")
+
+    return {
+        "brand": brand or None,
+        "name": name or None,
+        "rating": rating,
+        "votes": votes,
+    }
