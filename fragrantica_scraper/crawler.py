@@ -61,7 +61,7 @@ def _brand_to_perfume_slug(brand: str) -> str:
     return "-".join(words)
 
 
-def crawl(args: Namespace) -> None:
+def crawl(args: Namespace) -> int:
     # Determine brand (company) if provided
     brand_input = (args.brand or "").strip()
     if not brand_input and sys.stdin and sys.stdin.isatty():
@@ -324,5 +324,6 @@ def crawl(args: Namespace) -> None:
 
     print(f"\nDone. Pages processed (perfume pages saved/attempted): {pages_processed}")
     print(f"CSV path: {out_csv}")
+    return pages_processed
 
 __all__ = ["crawl"]
