@@ -102,13 +102,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--proxies-file",
-        help="Path to a file with one proxy per line. Lines starting with # are ignored.",
+        default="proxies.txt",
+        help="Path to a file with one proxy per line (format: http://user:pass@host:port). Lines starting with # are ignored.",
     )
     parser.add_argument(
         "--rotate-every",
         type=int,
-        default=0,
-        help="Rotate proxy/User-Agent/Accept-Language after N processed perfume pages (0 disables).",
+        default=30,
+        help="Rotate proxy after N requests (independent of session breaks). Default: 30.",
     )
 
     # Provide a friendlier message if no arguments were supplied, instead of argparse error
@@ -158,6 +159,8 @@ def main() -> None:
             print("[error] Do not combine --start-url with --brands/--brands-file", file=sys.stderr)
             sys.exit(2)
 
+        saved_since_break = 0
+
         for brand in brands:
             per_brand_args = copy.deepcopy(args)
             per_brand_args.brand = brand
@@ -165,7 +168,12 @@ def main() -> None:
             # Keep default so crawler auto-names to Saved Data/<brand>.csv
             per_brand_args.out_csv = "perfumes.csv"
 
+            # Carry the "saved since last cooldown" counter across brands so session-size is global.
+            per_brand_args.saved_since_break = saved_since_break
+
             crawl(per_brand_args)
+
+            saved_since_break = int(getattr(per_brand_args, "saved_since_break_end", saved_since_break) or 0)
         return
 
     crawl(args)

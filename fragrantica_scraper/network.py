@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Iterable, Optional, Set
+from typing import Optional, Set, TYPE_CHECKING
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
 import urllib.robotparser as robotparser
+
+try:
+    import cloudscraper  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    cloudscraper = None
+
+if TYPE_CHECKING:  # pragma: no cover
+    import cloudscraper as _cloudscraper
 
 from .config import (
     AVOID_PREFIXES,
@@ -29,8 +37,12 @@ def build_session(
     timeout: float,
     proxy: Optional[str] = None,
     accept_language: Optional[str] = None,
+
 ) -> requests.Session:
-    """Create a configured requests.Session.
+    """Create a configured HTTP session.
+
+    Prefers `cloudscraper` (when installed) to bypass Cloudflare.
+    Falls back to a plain `requests.Session` when `cloudscraper` is unavailable.
 
     If the given user-agent matches the placeholder, a realistic UA and
     Accept-Language will be chosen for the session.
@@ -39,15 +51,47 @@ def build_session(
         user_agent = random.choice(DEFAULT_UAS)
     if not accept_language:
         accept_language = random.choice(DEFAULT_ACCEPT_LANGS)
-    s = requests.Session()
-    s.headers.update(
-        {
-            "User-Agent": user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": accept_language,
-            "Connection": "keep-alive",
-        }
-    )
+
+    # Create cloudscraper session with browser configuration
+    # Determine browser type from UA
+    browser = None
+    if "Chrome" in user_agent and "Edg" not in user_agent:
+        browser = "chrome"
+    elif "Firefox" in user_agent:
+        browser = "firefox"
+
+    if cloudscraper is not None:
+        s = cloudscraper.create_scraper(
+            browser={
+                "browser": browser or "chrome",
+                "platform": "windows"
+                if "Windows" in user_agent
+                else "darwin"
+                if "Mac" in user_agent
+                else "linux",
+                "desktop": True,
+            }
+        )
+    else:
+        s = requests.Session()
+
+    # Additional headers for more realistic requests
+    headers = {
+        "User-Agent": user_agent,
+        "Accept-Language": accept_language,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1",
+    }
+
+    s.headers.update(headers)
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     # mypy: ignore[attr-defined] — attribute used by our code, not part of Session API
@@ -77,8 +121,19 @@ def normalize_url(url: str) -> Optional[str]:
         return None
 
 
-def extract_links(base_url: str, soup: BeautifulSoup) -> Set[str]:
+def extract_links(base_url: str, soup: BeautifulSoup, limit_perfume_links: int = 0) -> Set[str]:
+    """Extract links from a page.
+    
+    Args:
+        base_url: The URL of the page being parsed
+        soup: BeautifulSoup object of the page
+        limit_perfume_links: If > 0, limit the number of perfume links extracted from designer pages
+                            to avoid overwhelming the queue. Designer pages themselves are not limited.
+    """
     links: Set[str] = set()
+    perfume_links: list[str] = []
+    designer_links: list[str] = []
+    
     for a in soup.find_all("a", href=True):
         full = urljoin(base_url, a["href"])  # absolute
         full = normalize_url(full)
@@ -88,16 +143,35 @@ def extract_links(base_url: str, soup: BeautifulSoup) -> Set[str]:
         if u.netloc != DOMAIN:
             continue
         path = u.path or "/"
-        # Allow only perfume detail pages; skip sensitive/rate-limited sections
-        if not PERFUME_PATH_RE.match(path):
+        # Allow perfume detail pages and designer pages (for navigation)
+        if PERFUME_PATH_RE.match(path):
+            # This is a perfume detail page
+            perfume_links.append(full)
+        elif path.startswith("/designers/"):
+            # Allow designer pages for navigation to perfume pages
+            designer_links.append(full)
+        else:
+            # Skip other paths (board, search, news, articles, perfumery, etc.)
             if any(path.startswith(p) for p in AVOID_PREFIXES):
                 continue
-            # Skip non-perfume paths altogether
+            # Skip non-perfume, non-designer paths
             continue
-        # Exclude obvious non-HTML assets
-        if any(full.lower().endswith(ext) for ext in (".jpg", ".png", ".gif", ".svg", ".css", ".js", ".json", ".xml")):
-            continue
-        links.add(full)
+    
+    # Add designer links (no limit)
+    for link in designer_links:
+        if not any(link.lower().endswith(ext) for ext in (".jpg", ".png", ".gif", ".svg", ".css", ".js", ".json", ".xml")):
+            links.add(link)
+    
+    # Add perfume links with optional limit
+    if limit_perfume_links > 0 and len(perfume_links) > limit_perfume_links:
+        # Randomly sample to avoid bias toward alphabetically first perfumes
+        import random
+        perfume_links = random.sample(perfume_links, limit_perfume_links)
+    
+    for link in perfume_links:
+        if not any(link.lower().endswith(ext) for ext in (".jpg", ".png", ".gif", ".svg", ".css", ".js", ".json", ".xml")):
+            links.add(link)
+    
     return links
 
 
