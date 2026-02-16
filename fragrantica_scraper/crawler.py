@@ -119,11 +119,25 @@ def _scrape_brand_simple(
     # Load proxies
     proxies = _load_proxies(args)
     proxy_index = -1
+    proxy_failures = {}  # Track failures per proxy
 
     def get_next_proxy() -> Optional[str]:
         nonlocal proxy_index
         if not proxies:
             return None
+        # Skip proxies that have failed too many times recently
+        max_attempts = len(proxies) * 2  # Avoid infinite loop
+        attempts = 0
+        while attempts < max_attempts:
+            proxy_index = (proxy_index + 1) % len(proxies)
+            candidate = proxies[proxy_index]
+            # Allow proxy if it has fewer than 3 recent failures
+            if proxy_failures.get(candidate, 0) < 3:
+                return candidate
+            attempts += 1
+        # If all proxies are bad, reset failures and try again
+        print("[warn] All proxies have failures, resetting failure counts")
+        proxy_failures.clear()
         proxy_index = (proxy_index + 1) % len(proxies)
         return proxies[proxy_index]
 
@@ -212,6 +226,8 @@ def _scrape_brand_simple(
     saved_count = 0
     saved_since_break = int(getattr(args, "saved_since_break", 0) or 0)
     requests_since_rotate = 0
+    failed_urls = []  # Track failed URLs for retry
+    proxy_failures = {}  # Track failures per proxy to blacklist bad ones
 
     for idx, url in enumerate(perfume_urls, 1):
         print(f"[{idx}/{len(perfume_urls)}] Fetching: {url}")
@@ -245,6 +261,9 @@ def _scrape_brand_simple(
                 if resp.status_code in (429, 403):
                     print(f"[{resp.status_code}] Rate limited/blocked, forcing proxy rotation (attempt {attempt}/{max_retries})")
                     if attempt < max_retries and proxies:
+                        # Mark current proxy as problematic
+                        if current_proxy:
+                            proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
                         # Force proxy rotation
                         current_proxy = get_next_proxy()
                         ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
@@ -253,8 +272,8 @@ def _scrape_brand_simple(
                         print(f"[identity] Rotated: UA={ua[:50]}... Proxy={'<none>' if not current_proxy else current_proxy}")
                         # Reset rotation counter
                         requests_since_rotate = 0
-                        # Exponential backoff: 30s, 60s, 120s
-                        wait_time = 30 * (2 ** (attempt - 1))
+                        # Shorter backoff for rate limiting (5s, 10s, 20s)
+                        wait_time = 5 * (2 ** (attempt - 1))
                         print(f"[backoff] Waiting {wait_time}s before retry...")
                         time.sleep(wait_time)
                         continue
@@ -272,11 +291,52 @@ def _scrape_brand_simple(
                     print(f"[skip] Status {resp.status_code}")
                     break
 
+                # Success - clear proxy failure counter if using proxy
+                if current_proxy and current_proxy in proxy_failures:
+                    proxy_failures[current_proxy] = max(0, proxy_failures[current_proxy] - 1)
+
                 soup = BeautifulSoup(resp.text, "lxml")
                 success = True
                 break
 
+            except requests.exceptions.ProxyError as e:
+                # Proxy connection failed (502, tunnel errors, etc.)
+                print(f"[error] Proxy error (attempt {attempt}/{max_retries}): {e}")
+                if current_proxy:
+                    proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
+                    print(f"[proxy] Marked {current_proxy} as problematic ({proxy_failures[current_proxy]} failures)")
+
+                # Immediately rotate proxy on proxy errors, don't retry with same proxy
+                if attempt < max_retries and proxies:
+                    current_proxy = get_next_proxy()
+                    ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+                    accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
+                    session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
+                    print(f"[identity] Rotated to: Proxy={'<none>' if not current_proxy else current_proxy}")
+                    requests_since_rotate = 0
+                    # Short delay before retry (2s, 4s, 8s)
+                    time.sleep(2 * attempt)
+                    continue
+                break
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                # Connection timeout or failure - likely proxy issue
+                print(f"[error] Connection error (attempt {attempt}/{max_retries}): {e}")
+                if current_proxy:
+                    proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
+
+                # Rotate proxy on connection errors
+                if attempt < max_retries and proxies:
+                    current_proxy = get_next_proxy()
+                    session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
+                    print(f"[identity] Rotated to: Proxy={'<none>' if not current_proxy else current_proxy}")
+                    requests_since_rotate = 0
+                    time.sleep(2 * attempt)
+                    continue
+                break
+
             except Exception as e:
+                # Other errors - less aggressive rotation
                 print(f"[error] Request failed (attempt {attempt}/{max_retries}): {e}")
                 if attempt < max_retries:
                     time.sleep(5 * attempt)
@@ -284,6 +344,7 @@ def _scrape_brand_simple(
                 break
 
         if not success or not soup:
+            failed_urls.append(url)
             continue
 
         # Increment request counter after each successful or failed request
@@ -338,10 +399,56 @@ def _scrape_brand_simple(
                 session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
                 print(f"[identity] New session: UA={ua[:50]}... Accept-Language={accept_lang} Proxy={'<none>' if not current_proxy else current_proxy}")
 
+    # Retry failed URLs once
+    if failed_urls:
+        print(f"\n[retry] {len(failed_urls)} URLs failed. Retrying once...")
+        for retry_idx, url in enumerate(failed_urls, 1):
+            print(f"[retry {retry_idx}/{len(failed_urls)}] {url}")
+
+            # Brief delay before retry
+            time.sleep(random.uniform(args.delay_seconds, args.delay_seconds + 2.0))
+
+            # Try once more with fresh session/proxy
+            current_proxy = get_next_proxy()
+            ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+            accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
+            session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
+
+            try:
+                resp = session.get(url, timeout=args.timeout)
+                if resp.status_code == 200:
+                    soup = BeautifulSoup(resp.text, "lxml")
+                    data = scrape_perfume_page(url, soup)
+
+                    if data["brand"] and data["name"] and data["rating"] is not None and data["votes"] is not None:
+                        row = {
+                            "brand": data["brand"],
+                            "name": data["name"],
+                            "rating": data["rating"],
+                            "votes": data["votes"],
+                            "url": url,
+                            "last_crawled": dt.datetime.utcnow().isoformat(),
+                        }
+                        append_row(out_csv, row)
+                        append_row(mirror_csv, row)
+                        existing_urls.add(url)
+                        saved_count += 1
+                        print(f"[saved] {data['brand']} — {data['name']} | {data['rating']} (votes: {data['votes']})")
+                    else:
+                        print(f"[skip] Missing data or no ratings")
+                else:
+                    print(f"[skip] Status {resp.status_code}")
+            except Exception as e:
+                print(f"[error] Retry failed: {e}")
+
     # Store counter for multi-brand runs
     args.saved_since_break_end = saved_since_break
 
     print(f"\n[done] Saved {saved_count} new perfumes for {brand_input}")
+    if failed_urls:
+        still_failed = len(failed_urls) - (saved_count - (len(perfume_urls) - len(failed_urls)))
+        if still_failed > 0:
+            print(f"[warn] {still_failed} URLs could not be saved after retry")
     print(f"[csv] {out_csv}")
     return saved_count
 
@@ -386,24 +493,39 @@ def crawl(args: Namespace) -> int:
     # Build proxy list
     proxies = _load_proxies(args)
     proxy_index = -1
+    proxy_failures = {}  # Track failures per proxy
 
     def get_next_proxy() -> Optional[str]:
         nonlocal proxy_index
         if not proxies:
             return None
+        # Skip proxies that have failed too many times recently
+        max_attempts = len(proxies) * 2  # Avoid infinite loop
+        attempts = 0
+        while attempts < max_attempts:
+            proxy_index = (proxy_index + 1) % len(proxies)
+            candidate = proxies[proxy_index]
+            # Allow proxy if it has fewer than 3 recent failures
+            if proxy_failures.get(candidate, 0) < 3:
+                return candidate
+            attempts += 1
+        # If all proxies are bad, reset failures and try again
+        print("[warn] All proxies have failures, resetting failure counts")
+        proxy_failures.clear()
         proxy_index = (proxy_index + 1) % len(proxies)
         return proxies[proxy_index]
 
     # Current identity state
     current_accept_language = None
     ua = args.user_agent
+    current_proxy = None
 
     session = None
 
     def rotate_identity(per_session: bool = False):
-        nonlocal session, ua, current_accept_language
+        nonlocal session, ua, current_accept_language, current_proxy
         # Advance proxy if any
-        next_proxy = get_next_proxy()
+        current_proxy = get_next_proxy()
         # Choose UA: if user used placeholder default, rotate; else keep provided UA
         if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)":
             ua = random.choice(DEFAULT_UAS)
@@ -411,10 +533,10 @@ def crawl(args: Namespace) -> int:
             ua = args.user_agent
         # Rotate Accept-Language from a small pool
         current_accept_language = random.choice(DEFAULT_ACCEPT_LANGS)
-        session = build_session(ua, args.timeout, proxy=next_proxy, accept_language=current_accept_language)
+        session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=current_accept_language)
         if per_session:
             print("[identity] New session identity:",
-                  f"proxy={'<none>' if not next_proxy else next_proxy}",
+                  f"proxy={'<none>' if not current_proxy else current_proxy}",
                   f"UA={ua[:50]}...",
                   f"Accept-Language={current_accept_language}")
 
@@ -516,7 +638,42 @@ def crawl(args: Namespace) -> int:
                     headers["Sec-Fetch-Site"] = "same-origin"
 
                 resp = session.get(url, timeout=args.timeout, headers=headers, allow_redirects=True)
+            except requests.exceptions.ProxyError as e:
+                # Proxy connection failed (502, tunnel errors, etc.)
+                print(f"[error] Proxy error (attempt {attempt}/{MAX_RETRIES}): {e}")
+                if current_proxy:
+                    proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
+                    print(f"[proxy] Marked {current_proxy} as problematic ({proxy_failures[current_proxy]} failures)")
+
+                # Immediately rotate proxy on proxy errors
+                if attempt < MAX_RETRIES and proxies:
+                    rotate_identity()
+                    requests_since_rotate = 0
+                    # Short delay before retry (2s, 4s, 8s)
+                    time.sleep(2 * attempt)
+                    attempt += 1
+                    continue
+                print(f"[error] Request failed (give up): {url} ({e})")
+                break
+
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                # Connection timeout or failure - likely proxy issue
+                print(f"[error] Connection error (attempt {attempt}/{MAX_RETRIES}): {e}")
+                if current_proxy:
+                    proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
+
+                # Rotate proxy on connection errors
+                if attempt < MAX_RETRIES and proxies:
+                    rotate_identity()
+                    requests_since_rotate = 0
+                    time.sleep(2 * attempt)
+                    attempt += 1
+                    continue
+                print(f"[error] Request failed (give up): {url} ({e})")
+                break
+
             except requests.RequestException as e:
+                # Other request exceptions - less aggressive rotation
                 if attempt >= MAX_RETRIES:
                     print(f"[error] Request failed (give up): {url} ({e})")
                     break
@@ -531,12 +688,15 @@ def crawl(args: Namespace) -> int:
             if resp.status_code in (429, 403):
                 if attempt < MAX_RETRIES:
                     print(f"[{resp.status_code}] Rate limited/blocked, forcing proxy rotation (attempt {attempt}/{MAX_RETRIES}): {url}")
+                    if current_proxy:
+                        proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
                     if proxies:
                         # Force proxy rotation and reset counter
                         rotate_identity()
                         requests_since_rotate = 0
                         print(f"[identity] Rotated to next proxy")
-                    backoff_sleep(resp, base_delay=args.delay_seconds * 2, attempt=attempt)
+                    # Shorter backoff (5s, 10s, 20s)
+                    time.sleep(5 * (2 ** (attempt - 1)))
                     attempt += 1
                     continue
                 print(f"[skip] Status {resp.status_code} after {MAX_RETRIES} retries: {url}")
@@ -557,7 +717,10 @@ def crawl(args: Namespace) -> int:
                 polite_sleep(args.delay_seconds, args.delay_seconds + 1.0)
                 break
 
-            # Success
+            # Success - clear proxy failure counter if using proxy
+            if current_proxy and current_proxy in proxy_failures:
+                proxy_failures[current_proxy] = max(0, proxy_failures[current_proxy] - 1)
+
             soup = BeautifulSoup(resp.text, "lxml")
             success = True
             break
