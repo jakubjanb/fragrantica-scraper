@@ -83,6 +83,79 @@ def parse_brand_name_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def parse_category_and_sex(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+    """Extract fragrance category and target sex from the opening description.
+
+    Parses patterns like:
+        "Orphéon Eau de Parfum by Diptyque is a Woody Chypre fragrance for women and men."
+    Returns:
+        (category, sex) e.g. ("Woody Chypre", "women and men")
+
+    Uses a 3-tier strategy to avoid false positives from unrelated page text:
+    1. Meta description tags (cleanest source)
+    2. Individual paragraph/div elements
+    3. Full page text with findall (prefer matches with category)
+
+    Never early-returns on sex-only matches — keeps searching all tiers for a
+    category+sex match first, falls back to sex-only at the very end.
+    """
+    CATEGORY_SEX_RE = re.compile(
+        r"is\s+an?\s+([^\.]+?)\s+fragrance\s+for\s+([^\.]+?)[\.\,]", re.IGNORECASE
+    )
+    SEX_ONLY_RE = re.compile(
+        r"is\s+a\s+fragrance\s+for\s+(.+?)[\.\,]", re.IGNORECASE
+    )
+    sex_fallback: Optional[str] = None  # best sex-only match across all tiers
+
+    # 1) Try meta description tags (cleanest source, no HTML noise)
+    for attr in (
+        {"name": "description"},
+        {"property": "og:description"},
+    ):
+        tag = soup.find("meta", attrs=attr)
+        if not (tag and tag.get("content")):
+            continue
+        text = tag["content"]
+        m = CATEGORY_SEX_RE.search(text)
+        if m and len(clean_space(m.group(1))) <= 80:
+            return clean_space(m.group(1)), clean_space(m.group(2))
+        if sex_fallback is None:
+            m2 = SEX_ONLY_RE.search(text)
+            if m2:
+                sex_fallback = clean_space(m2.group(1))
+
+    # 2) Search individual elements (avoids cross-element false positives)
+    for el in soup.find_all(["p", "div", "span"]):
+        text = el.get_text(" ", strip=True)
+        if "fragrance for" not in text.lower():
+            continue
+        m = CATEGORY_SEX_RE.search(text)
+        if m:
+            cat = clean_space(m.group(1))
+            if len(cat) <= 80:
+                return cat, clean_space(m.group(2))
+        if sex_fallback is None:
+            m2 = SEX_ONLY_RE.search(text)
+            if m2:
+                sex_fallback = clean_space(m2.group(1))
+
+    # 3) Fallback: full page text, findall to prefer matches with category
+    page_text = soup.get_text(" ", strip=True)
+    for cat_raw, sex_raw in CATEGORY_SEX_RE.findall(page_text):
+        cat = clean_space(cat_raw)
+        if len(cat) <= 80:
+            return cat, clean_space(sex_raw)
+    if sex_fallback is None:
+        m = SEX_ONLY_RE.search(page_text)
+        if m:
+            sex_fallback = clean_space(m.group(1))
+
+    # Return sex-only fallback if no category was found anywhere
+    if sex_fallback:
+        return None, sex_fallback
+    return None, None
+
+
 def scrape_perfume_page(url: str, soup: BeautifulSoup) -> Dict[str, object]:
     """Extract brand, name, rating, votes from a fragrance detail page."""
     page_text = soup.get_text(" ", strip=True)
