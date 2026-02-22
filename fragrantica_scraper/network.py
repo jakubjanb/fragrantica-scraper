@@ -16,12 +16,34 @@ from bs4 import BeautifulSoup
 import urllib.robotparser as robotparser
 
 try:
+    from curl_cffi import requests as curl_requests  # type: ignore
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None  # type: ignore[assignment]
+    HAS_CURL_CFFI = False
+
+try:
     import cloudscraper  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
     cloudscraper = None
 
 if TYPE_CHECKING:  # pragma: no cover
     import cloudscraper as _cloudscraper
+
+# Which HTTP backend is active (for logging)
+HTTP_BACKEND: str = (
+    "curl-cffi" if HAS_CURL_CFFI else
+    "cloudscraper" if cloudscraper is not None else
+    "requests"
+)
+
+# curl_cffi impersonation config — UA MUST exactly match the impersonation target
+# so Cloudflare's TLS fingerprint check and User-Agent are consistent.
+CURL_CFFI_IMPERSONATE: str = "chrome131"
+CURL_CFFI_UA: str = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 
 from .config import (
     AVOID_PREFIXES,
@@ -52,18 +74,29 @@ def build_session(
     if not accept_language:
         accept_language = random.choice(DEFAULT_ACCEPT_LANGS)
 
-    # Create cloudscraper session with browser configuration
     # Determine browser type from UA
-    browser = None
-    if "Chrome" in user_agent and "Edg" not in user_agent:
-        browser = "chrome"
-    elif "Firefox" in user_agent:
+    browser = "chrome"
+    if "Firefox" in user_agent:
         browser = "firefox"
+    elif "Safari" in user_agent and "Chrome" not in user_agent:
+        browser = "safari"
 
-    if cloudscraper is not None:
+    if HAS_CURL_CFFI and curl_requests is not None:
+        # curl_cffi impersonates Chrome at the TLS + HTTP/2 level — this is what
+        # Cloudflare Bot Management actually checks. We MUST NOT override the
+        # Sec-Fetch-*, Accept-Encoding, Accept etc. headers because curl_cffi's
+        # impersonation already sets them in the exact order/format Chrome uses.
+        # Overriding them would break the HTTP/2 header fingerprint.
+        # Only set User-Agent (must match impersonation) and Accept-Language.
+        s = curl_requests.Session(impersonate=CURL_CFFI_IMPERSONATE)
+        s.headers.update({
+            "User-Agent": CURL_CFFI_UA,
+            "Accept-Language": accept_language,
+        })
+    elif cloudscraper is not None:
         s = cloudscraper.create_scraper(
             browser={
-                "browser": browser or "chrome",
+                "browser": browser if browser in ("chrome", "firefox") else "chrome",
                 "platform": "windows"
                 if "Windows" in user_agent
                 else "darwin"
@@ -72,30 +105,44 @@ def build_session(
                 "desktop": True,
             }
         )
+        headers = {
+            "User-Agent": user_agent,
+            "Accept-Language": accept_language,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "max-age=0",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1",
+        }
+        s.headers.update(headers)
     else:
         s = requests.Session()
-
-    # Additional headers for more realistic requests
-    headers = {
-        "User-Agent": user_agent,
-        "Accept-Language": accept_language,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "DNT": "1",
-    }
-
-    s.headers.update(headers)
+        headers = {
+            "User-Agent": user_agent,
+            "Accept-Language": accept_language,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control": "max-age=0",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1",
+        }
+        s.headers.update(headers)
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
-    # mypy: ignore[attr-defined] — attribute used by our code, not part of Session API
-    s.timeout = timeout  # type: ignore[attr-defined]
+    try:
+        s.timeout = timeout  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
     return s
 
 

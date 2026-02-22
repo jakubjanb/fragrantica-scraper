@@ -175,9 +175,13 @@ def scrape_perfume_page(url: str, soup: BeautifulSoup) -> Dict[str, object]:
     brand = clean_space(brand or "")
     name = clean_space(name or "")
 
+    category, sex = parse_category_and_sex(soup)
+
     return {
         "brand": brand or None,
         "name": name or None,
         "rating": rating,
         "votes": votes,
+        "sex": sex or "",
+        "fragrance_category": category or "",
     }

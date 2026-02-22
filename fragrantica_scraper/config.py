@@ -39,7 +39,7 @@ RATING_VOTES_RE: Final[re.Pattern[str]] = re.compile(
 DESIGNER_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^\s*Designer\s*", re.IGNORECASE)
 
 # CSV fields
-CSV_FIELDS: Final[List[str]] = ["brand", "name", "rating", "votes", "url", "last_crawled"]
+CSV_FIELDS: Final[List[str]] = ["brand", "name", "rating", "votes", "url", "last_crawled", "sex", "fragrance_category"]
 
 # Defaults for networking
 DEFAULT_UAS: Final[List[str]] = [

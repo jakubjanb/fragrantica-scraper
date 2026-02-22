@@ -161,7 +161,8 @@ def main() -> None:
 
         saved_since_break = 0
 
-        for brand in brands:
+        for i, brand in enumerate(brands, 1):
+            print(f"\n[multi] Brand {i}/{len(brands)}: {brand}")
             per_brand_args = copy.deepcopy(args)
             per_brand_args.brand = brand
             per_brand_args.start_url = None

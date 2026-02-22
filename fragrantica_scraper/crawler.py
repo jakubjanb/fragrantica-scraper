@@ -36,6 +36,8 @@ from .network import (
     polite_sleep,
     session_sleep,
     backoff_sleep,
+    HTTP_BACKEND,
+    CURL_CFFI_UA,
 )
 from .parsing import parse_brand_name_from_url, scrape_perfume_page
 from .storage import ensure_csv_with_header, load_existing_urls, append_row
@@ -145,69 +147,136 @@ def _scrape_brand_simple(
     designers_slug = _brand_to_designers_slug(brand_input)
     brand_url = f"https://{DOMAIN}/designers/{designers_slug}.html"
 
+    def _choose_ua() -> str:
+        """Return the UA that matches the active HTTP backend."""
+        if HTTP_BACKEND == "curl-cffi":
+            return CURL_CFFI_UA  # must match the curl_cffi impersonation target
+        if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)":
+            return random.choice(DEFAULT_UAS)
+        return args.user_agent
+
     # Create session with realistic headers
-    ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+    ua = _choose_ua()
     accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
     current_proxy = get_next_proxy()
 
     session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
-    print(f"[identity] UA={ua[:50]}... Accept-Language={accept_lang} Proxy={'<none>' if not current_proxy else current_proxy}")
+    print(f"[identity] [{HTTP_BACKEND}] UA={ua[:50]}... Accept-Language={accept_lang} Proxy={'<none>' if not current_proxy else current_proxy}")
 
-    # Fetch brand page
+    # Fetch brand page with retry on 403/429 (Cloudflare may need a proxy rotation)
     print(f"[fetch] Brand page: {brand_url}")
-    try:
-        resp = session.get(brand_url, timeout=args.timeout)
-        if resp.status_code != 200:
-            print(f"[error] Failed to fetch brand page (status {resp.status_code})")
-            return 0
+    resp = None
+    for brand_attempt in range(1, 4):
+        try:
+            r = session.get(brand_url, timeout=args.timeout)
+            if r.status_code == 200:
+                resp = r
+                break
+            if r.status_code in (403, 429) and brand_attempt < 3:
+                wait = 15 * brand_attempt
+                print(f"[{r.status_code}] Brand page blocked (attempt {brand_attempt}/3) — rotating proxy, waiting {wait}s")
+                if current_proxy:
+                    proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
+                current_proxy = get_next_proxy()
+                accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
+                session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
+                print(f"[rotate] New proxy: {'<none>' if not current_proxy else current_proxy}")
+                time.sleep(wait)
+            else:
+                print(f"[error] Failed to fetch brand page (status {r.status_code})")
+                return 0
+        except Exception as e:
+            if brand_attempt < 3:
+                print(f"[error] Brand page exception (attempt {brand_attempt}/3): {e} — retrying")
+                time.sleep(5 * brand_attempt)
+            else:
+                print(f"[error] Exception fetching brand page: {e}")
+                return 0
 
-        soup = BeautifulSoup(resp.text, "lxml")
-        print(f"[ok] Brand page loaded successfully")
-    except Exception as e:
-        print(f"[error] Exception fetching brand page: {e}")
+    if resp is None:
+        print("[error] Failed to fetch brand page after 3 attempts")
+        return 0
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    print(f"[ok] Brand page loaded successfully")
+
+    # Verify the page actually loaded real content (not a Cloudflare challenge)
+    page_text_raw = resp.text
+    all_a_tags = soup.find_all("a", href=True)
+    html_preview = " ".join(page_text_raw[:500].split())
+    print(f"[debug] Brand page has {len(all_a_tags)} total <a> tags, {len(page_text_raw)} bytes")
+    print(f"[debug] HTML preview: {html_preview[:300]}")
+
+    # Only flag as a challenge if the page is structurally empty.
+    # Do NOT check for string markers like "turnstile"/"challenge-platform":
+    # these are normal English words / Cloudflare analytics snippets that appear
+    # in real pages too (e.g. Fragrantica includes CF Insights JS on every page).
+    # A real brand page always has many navigation + perfume <a> links.
+    is_challenge = len(page_text_raw) < 5000 or len(all_a_tags) < 5
+    if is_challenge:
+        print("[warn] Page looks like a Cloudflare challenge or empty — very few links/content")
+        if HTTP_BACKEND != "curl-cffi":
+            print("[hint] Install curl-cffi for better bypass: pip install curl-cffi")
         return 0
 
     # Extract all perfume URLs from brand page
     # The brand slug should match the URL path for brand filtering
     expected_brand_slug = _brand_to_perfume_slug(brand_input).casefold()
 
-    perfume_urls = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
+    def _extract_urls_from_soup(s: BeautifulSoup) -> list:
+        """Extract new perfume URLs for this brand from a soup object."""
+        urls = []
+        for a in s.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("/perfume/"):
+                href = f"https://{DOMAIN}{href}"
+            if not PERFUME_URL_RE.match(href):
+                continue
+            url_parts = href.split("/perfume/")
+            if len(url_parts) < 2:
+                continue
+            path_after_perfume = url_parts[1]
+            brand_from_url = path_after_perfume.split("/")[0] if "/" in path_after_perfume else ""
+            if brand_from_url.casefold() != expected_brand_slug:
+                continue
+            full_url = normalize_url(href)
+            if full_url and full_url not in existing_urls:
+                urls.append(full_url)
+        return urls
 
-        # Convert relative to absolute
-        if href.startswith("/perfume/"):
-            href = f"https://{DOMAIN}{href}"
-
-        # Check if this is a perfume URL
-        if not PERFUME_URL_RE.match(href):
-            continue
-
-        # Filter by brand: the URL should contain /perfume/<BrandSlug>/
-        # Extract brand from URL path
-        url_parts = href.split("/perfume/")
-        if len(url_parts) < 2:
-            continue
-
-        # Get the brand part from URL (between /perfume/ and next /)
-        path_after_perfume = url_parts[1]
-        brand_from_url = path_after_perfume.split("/")[0] if "/" in path_after_perfume else ""
-
-        # Compare brand slugs (case-insensitive)
-        if brand_from_url.casefold() != expected_brand_slug:
-            continue
-
-        full_url = normalize_url(href)
-        if full_url and full_url not in existing_urls:
-            perfume_urls.append(full_url)
-
-    # Remove duplicates while preserving order
-    seen_in_batch = set()
-    unique_perfume_urls = []
-    for url in perfume_urls:
+    # Build deduplicated URL set incrementally so pagination stops as soon as a
+    # page adds nothing new (handles brands whose page doesn't actually paginate).
+    seen_in_batch: set = set()
+    perfume_urls: list = []
+    for url in _extract_urls_from_soup(soup):
         if url not in seen_in_batch:
             seen_in_batch.add(url)
-            unique_perfume_urls.append(url)
+            perfume_urls.append(url)
+    print(f"[page 1] Found {len(perfume_urls)} unique perfume URLs")
+
+    # Paginate through subsequent brand pages (?p=2, ?p=3, …)
+    MAX_BRAND_PAGES = 25
+    for page_num in range(2, MAX_BRAND_PAGES + 1):
+        page_url = f"{brand_url}?p={page_num}"
+        try:
+            time.sleep(random.uniform(args.delay_seconds * 0.4, args.delay_seconds * 0.8))
+            page_resp = session.get(page_url, timeout=args.timeout)
+            if page_resp.status_code != 200:
+                print(f"[page {page_num}] Status {page_resp.status_code} — stopping pagination")
+                break
+            page_soup = BeautifulSoup(page_resp.text, "lxml")
+            new_on_page = [u for u in _extract_urls_from_soup(page_soup) if u not in seen_in_batch]
+            print(f"[page {page_num}] Found {len(new_on_page)} new perfume URLs")
+            if not new_on_page:
+                # Page returned only already-known URLs — no real pagination here
+                break
+            seen_in_batch.update(new_on_page)
+            perfume_urls.extend(new_on_page)
+        except Exception as e:
+            print(f"[page {page_num}] Error fetching: {e} — stopping pagination")
+            break
+
+    unique_perfume_urls = perfume_urls  # already deduplicated above
 
     perfume_urls = unique_perfume_urls
 
@@ -236,7 +305,7 @@ def _scrape_brand_simple(
         if args.rotate_every > 0 and requests_since_rotate >= args.rotate_every:
             print(f"[rotate] Switching proxy after {requests_since_rotate} requests")
             current_proxy = get_next_proxy()
-            ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+            ua = _choose_ua()
             accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
             session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
             print(f"[identity] New: UA={ua[:50]}... Accept-Language={accept_lang} Proxy={'<none>' if not current_proxy else current_proxy}")
@@ -266,7 +335,7 @@ def _scrape_brand_simple(
                             proxy_failures[current_proxy] = proxy_failures.get(current_proxy, 0) + 1
                         # Force proxy rotation
                         current_proxy = get_next_proxy()
-                        ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+                        ua = _choose_ua()
                         accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
                         session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
                         print(f"[identity] Rotated: UA={ua[:50]}... Proxy={'<none>' if not current_proxy else current_proxy}")
@@ -309,7 +378,7 @@ def _scrape_brand_simple(
                 # Immediately rotate proxy on proxy errors, don't retry with same proxy
                 if attempt < max_retries and proxies:
                     current_proxy = get_next_proxy()
-                    ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+                    ua = _choose_ua()
                     accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
                     session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
                     print(f"[identity] Rotated to: Proxy={'<none>' if not current_proxy else current_proxy}")
@@ -371,6 +440,8 @@ def _scrape_brand_simple(
                     "votes": data["votes"],
                     "url": url,
                     "last_crawled": dt.datetime.utcnow().isoformat(),
+                    "sex": data.get("sex", ""),
+                    "fragrance_category": data.get("fragrance_category", ""),
                 }
                 append_row(out_csv, row)
                 append_row(mirror_csv, row)
@@ -393,7 +464,7 @@ def _scrape_brand_simple(
                 saved_since_break = 0
 
                 # Rotate identity (including proxy)
-                ua = random.choice(DEFAULT_UAS)
+                ua = _choose_ua()
                 accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
                 current_proxy = get_next_proxy()
                 session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
@@ -410,7 +481,7 @@ def _scrape_brand_simple(
 
             # Try once more with fresh session/proxy
             current_proxy = get_next_proxy()
-            ua = random.choice(DEFAULT_UAS) if args.user_agent == "Mozilla/5.0 (compatible; PerfumeBot/1.0; +https://example.com/botinfo)" else args.user_agent
+            ua = _choose_ua()
             accept_lang = random.choice(DEFAULT_ACCEPT_LANGS)
             session = build_session(ua, args.timeout, proxy=current_proxy, accept_language=accept_lang)
 
@@ -428,6 +499,8 @@ def _scrape_brand_simple(
                             "votes": data["votes"],
                             "url": url,
                             "last_crawled": dt.datetime.utcnow().isoformat(),
+                            "sex": data.get("sex", ""),
+                            "fragrance_category": data.get("fragrance_category", ""),
                         }
                         append_row(out_csv, row)
                         append_row(mirror_csv, row)
@@ -766,6 +839,8 @@ def crawl(args: Namespace) -> int:
                                 "votes": data["votes"],
                                 "url": url,
                                 "last_crawled": dt.datetime.utcnow().isoformat(),
+                                "sex": data.get("sex", ""),
+                                "fragrance_category": data.get("fragrance_category", ""),
                             }
                             append_row(out_csv, row)
                             append_row(mirror_csv, row)
@@ -790,6 +865,8 @@ def crawl(args: Namespace) -> int:
                             "votes": data["votes"],
                             "url": url,
                             "last_crawled": dt.datetime.utcnow().isoformat(),
+                            "sex": data.get("sex", ""),
+                            "fragrance_category": data.get("fragrance_category", ""),
                         }
                         append_row(out_csv, row)
                         append_row(mirror_csv, row)
